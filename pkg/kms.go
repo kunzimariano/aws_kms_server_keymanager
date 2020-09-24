@@ -2,6 +2,7 @@ package kms
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -16,6 +17,15 @@ import (
 	spi "github.com/spiffe/spire/proto/spire/common/plugin"
 	"github.com/spiffe/spire/proto/spire/server/keymanager"
 )
+
+// Major TODOS:
+// - error embellishment and wrapping
+// - logging
+// - maps from spire enums to kms enums
+// - input validations
+// - consume kmw client through an interface so we can replace it with a fake
+// - kms client fake
+// - testing
 
 const keyPrefix = "SPIRE_SERVER_KEY:"
 
@@ -99,22 +109,18 @@ func (k *Plugin) Configure(ctx context.Context, req *plugin.ConfigureRequest) (*
 	return &plugin.ConfigureResponse{}, nil
 }
 
-func (k *Plugin) GetPluginInfo(context.Context, *spi.GetPluginInfoRequest) (*spi.GetPluginInfoResponse, error) {
-	return &spi.GetPluginInfoResponse{}, nil
-}
-
-func (k *Plugin) GenerateKey(_ context.Context, req *keymanager.GenerateKeyRequest) (*keymanager.GenerateKeyResponse, error) {
+func (k *Plugin) GenerateKey(ctx context.Context, req *keymanager.GenerateKeyRequest) (*keymanager.GenerateKeyResponse, error) {
 	spireKeyID := req.KeyId
 	description := fmt.Sprintf("%v%v", keyPrefix, spireKeyID)
 
 	createKeyInput := &kms.CreateKeyInput{
 		Description:           aws.String(description), //TODO: check using alias instead
-		KeyUsage:              aws.String("SIGN_VERIFY"),
-		CustomerMasterKeySpec: aws.String("ECC_NIST_P256"), //TODO: build a map from input to this
+		KeyUsage:              aws.String(kms.KeyUsageTypeSignVerify),
+		CustomerMasterKeySpec: aws.String(kms.CustomerMasterKeySpecEccNistP256), //TODO: build a map from input to this
 		//TODO: look into policies
 	}
 
-	key, err := k.kmsClient.CreateKey(createKeyInput)
+	key, err := k.kmsClient.CreateKeyWithContext(ctx, createKeyInput)
 	if err != nil {
 		return nil, err
 	}
@@ -146,6 +152,50 @@ func (k *Plugin) GenerateKey(_ context.Context, req *keymanager.GenerateKeyReque
 	}
 
 	return &keymanager.GenerateKeyResponse{PublicKey: newEntry.PublicKey}, nil
+}
+
+func (k *Plugin) SignData(ctx context.Context, req *keymanager.SignDataRequest) (*keymanager.SignDataResponse, error) {
+	keyEntry, hasKey := k.entry(req.KeyId)
+	if !hasKey {
+		return nil, fmt.Errorf("could not find key: %v", req.KeyId)
+	}
+
+	signResp, err := k.kmsClient.SignWithContext(ctx, &kms.SignInput{
+		KeyId:            &keyEntry.AwsKeyID,
+		Message:          req.Data,
+		SigningAlgorithm: aws.String(kms.SigningAlgorithmSpecEcdsaSha256), //TODO: this should match the they key type we are using plus the input param
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &keymanager.SignDataResponse{Signature: signResp.Signature}, nil
+}
+
+func (k *Plugin) GetPublicKey(ctx context.Context, req *keymanager.GetPublicKeyRequest) (*keymanager.GetPublicKeyResponse, error) {
+	if req.KeyId == "" {
+		return nil, errors.New("KeyId is required")
+	}
+
+	resp := new(keymanager.GetPublicKeyResponse)
+
+	e, ok := k.entry(req.KeyId)
+	if !ok {
+		//TODO: isn't it better to return error?
+		return resp, nil
+	}
+
+	//TODO: clone it
+	resp.PublicKey = e.PublicKey
+	return resp, nil
+}
+
+func (k *Plugin) GetPublicKeys(context.Context, *keymanager.GetPublicKeysRequest) (*keymanager.GetPublicKeysResponse, error) {
+	return nil, nil
+}
+
+func (k *Plugin) GetPluginInfo(context.Context, *spi.GetPluginInfoRequest) (*spi.GetPluginInfoResponse, error) {
+	return &spi.GetPluginInfoResponse{}, nil
 }
 
 func (k *Plugin) setEntry(spireKeyID string, newEntry *entry) bool {
