@@ -15,7 +15,6 @@ import (
 	"github.com/aws/aws-sdk-go/service/kms"
 	"github.com/hashicorp/hcl"
 	"github.com/spiffe/spire/proto/spire/common/plugin"
-	spi "github.com/spiffe/spire/proto/spire/common/plugin"
 	"github.com/spiffe/spire/proto/spire/server/keymanager"
 )
 
@@ -200,8 +199,8 @@ func (p *Plugin) GetPublicKeys(context.Context, *keymanager.GetPublicKeysRequest
 	return &keymanager.GetPublicKeysResponse{PublicKeys: keys}, nil
 }
 
-func (p *Plugin) GetPluginInfo(context.Context, *spi.GetPluginInfoRequest) (*spi.GetPluginInfoResponse, error) {
-	return &spi.GetPluginInfoResponse{}, nil
+func (p *Plugin) GetPluginInfo(context.Context, *plugin.GetPluginInfoRequest) (*plugin.GetPluginInfoResponse, error) {
+	return &plugin.GetPluginInfoResponse{}, nil
 }
 
 func (p *Plugin) setEntry(spireKeyID string, newEntry *entry) bool {
