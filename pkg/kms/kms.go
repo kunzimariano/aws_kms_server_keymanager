@@ -24,7 +24,7 @@ import (
 // - logging
 // - maps from spire enums to kms enums
 // - input validations
-// - consume kmw client through an interface so we can replace it with a fake
+// - consume kms client through an interface so we can replace it with a fake
 // - kms client fake
 // - testing
 
@@ -38,7 +38,7 @@ type entry struct {
 
 type Plugin struct {
 	config    *Config
-	mu        sync.Mutex //TODO: review which mutex to use
+	mu        sync.RWMutex
 	entries   map[string]*entry
 	kmsClient *kms.KMS
 }
@@ -55,19 +55,19 @@ func New() *Plugin {
 	}
 }
 
-func (k *Plugin) Configure(ctx context.Context, req *plugin.ConfigureRequest) (*plugin.ConfigureResponse, error) {
+func (p *Plugin) Configure(ctx context.Context, req *plugin.ConfigureRequest) (*plugin.ConfigureResponse, error) {
 	config, err := configure(req.Configuration)
 	if err != nil {
 		return nil, err
 	}
 
-	k.config = config
+	p.config = config
 	kmsClient, err := newKMSClient(config)
 	if err != nil {
 		return nil, err
 	}
 
-	k.kmsClient = kmsClient
+	p.kmsClient = kmsClient
 
 	// TODO: pagination
 	listKeysResp, err := kmsClient.ListKeysWithContext(ctx, &kms.ListKeysInput{})
@@ -76,41 +76,45 @@ func (k *Plugin) Configure(ctx context.Context, req *plugin.ConfigureRequest) (*
 	}
 
 	for _, key := range listKeysResp.Keys {
-		//TODO: extract into a function
-		awsKeyID := key.KeyId
-		describeResp, err := kmsClient.DescribeKeyWithContext(ctx, &kms.DescribeKeyInput{KeyId: awsKeyID})
+		err := p.processKMSKey(ctx, key.KeyId)
 		if err != nil {
 			return nil, err
 		}
 
-		switch {
-		case *describeResp.KeyMetadata.Enabled == true && strings.HasPrefix(*describeResp.KeyMetadata.Description, keyPrefix):
-			descSplit := strings.SplitAfter(*describeResp.KeyMetadata.Description, keyPrefix)
-			spireKeyID := descSplit[1]
-			getPublicKeyResp, err := kmsClient.GetPublicKeyWithContext, (&kms.GetPublicKeyInput{KeyId: awsKeyID})
-			if err != nil {
-				return nil, err
-			}
-
-			e := &entry{
-				AwsKeyID:     *awsKeyID,
-				CreationDate: describeResp.KeyMetadata.CreationDate,
-				PublicKey: &keymanager.PublicKey{
-					Id: spireKeyID,
-					// TODO: KeyType
-					PkixData: getPublicKeyResp.PublicKey,
-				},
-			}
-			k.setEntry(spireKeyID, e)
-		default:
-			continue
-		}
 	}
 
 	return &plugin.ConfigureResponse{}, nil
 }
 
-func (k *Plugin) GenerateKey(ctx context.Context, req *keymanager.GenerateKeyRequest) (*keymanager.GenerateKeyResponse, error) {
+func (p *Plugin) processKMSKey(ctx context.Context, awsKeyID *string) error {
+	describeResp, err := p.kmsClient.DescribeKeyWithContext(ctx, &kms.DescribeKeyInput{KeyId: awsKeyID})
+	if err != nil {
+		return err
+	}
+
+	if *describeResp.KeyMetadata.Enabled == true && strings.HasPrefix(*describeResp.KeyMetadata.Description, keyPrefix) {
+		descSplit := strings.SplitAfter(*describeResp.KeyMetadata.Description, keyPrefix)
+		spireKeyID := descSplit[1]
+		getPublicKeyResp, err := p.kmsClient.GetPublicKeyWithContext(ctx, &kms.GetPublicKeyInput{KeyId: awsKeyID})
+		if err != nil {
+			return err
+		}
+
+		e := &entry{
+			AwsKeyID:     *awsKeyID,
+			CreationDate: describeResp.KeyMetadata.CreationDate,
+			PublicKey: &keymanager.PublicKey{
+				Id: spireKeyID,
+				// TODO: KeyType
+				PkixData: getPublicKeyResp.PublicKey,
+			},
+		}
+		p.setEntry(spireKeyID, e)
+	}
+	return nil
+}
+
+func (p *Plugin) GenerateKey(ctx context.Context, req *keymanager.GenerateKeyRequest) (*keymanager.GenerateKeyResponse, error) {
 	spireKeyID := req.KeyId
 	description := fmt.Sprintf("%v%v", keyPrefix, spireKeyID)
 
@@ -121,12 +125,12 @@ func (k *Plugin) GenerateKey(ctx context.Context, req *keymanager.GenerateKeyReq
 		//TODO: look into policies
 	}
 
-	key, err := k.kmsClient.CreateKeyWithContext(ctx, createKeyInput)
+	key, err := p.kmsClient.CreateKeyWithContext(ctx, createKeyInput)
 	if err != nil {
 		return nil, err
 	}
 
-	pub, err := k.kmsClient.GetPublicKeyWithContext(ctx, &kms.GetPublicKeyInput{KeyId: key.KeyMetadata.KeyId})
+	pub, err := p.kmsClient.GetPublicKeyWithContext(ctx, &kms.GetPublicKeyInput{KeyId: key.KeyMetadata.KeyId})
 	if err != nil {
 		return nil, err
 	}
@@ -141,12 +145,12 @@ func (k *Plugin) GenerateKey(ctx context.Context, req *keymanager.GenerateKeyReq
 		},
 	}
 
-	oldEntry, hasOldEntry := k.entry(spireKeyID)
-	ok := k.setEntry(spireKeyID, newEntry)
+	oldEntry, hasOldEntry := p.entry(spireKeyID)
+	ok := p.setEntry(spireKeyID, newEntry)
 
 	// only delete if an old entry was replaced by a new one
 	if hasOldEntry && ok {
-		_, err := k.kmsClient.ScheduleKeyDeletionWithContext(ctx, &kms.ScheduleKeyDeletionInput{KeyId: &oldEntry.AwsKeyID})
+		_, err := p.kmsClient.ScheduleKeyDeletionWithContext(ctx, &kms.ScheduleKeyDeletionInput{KeyId: &oldEntry.AwsKeyID})
 		if err != nil {
 			return nil, err
 		}
@@ -155,13 +159,13 @@ func (k *Plugin) GenerateKey(ctx context.Context, req *keymanager.GenerateKeyReq
 	return &keymanager.GenerateKeyResponse{PublicKey: newEntry.PublicKey}, nil
 }
 
-func (k *Plugin) SignData(ctx context.Context, req *keymanager.SignDataRequest) (*keymanager.SignDataResponse, error) {
-	keyEntry, hasKey := k.entry(req.KeyId)
+func (p *Plugin) SignData(ctx context.Context, req *keymanager.SignDataRequest) (*keymanager.SignDataResponse, error) {
+	keyEntry, hasKey := p.entry(req.KeyId)
 	if !hasKey {
 		return nil, fmt.Errorf("could not find key: %v", req.KeyId)
 	}
 
-	signResp, err := k.kmsClient.SignWithContext(ctx, &kms.SignInput{
+	signResp, err := p.kmsClient.SignWithContext(ctx, &kms.SignInput{
 		KeyId:            &keyEntry.AwsKeyID,
 		Message:          req.Data,
 		SigningAlgorithm: aws.String(kms.SigningAlgorithmSpecEcdsaSha256), //TODO: this should match the they key type we are using plus the input param
@@ -173,14 +177,14 @@ func (k *Plugin) SignData(ctx context.Context, req *keymanager.SignDataRequest) 
 	return &keymanager.SignDataResponse{Signature: signResp.Signature}, nil
 }
 
-func (k *Plugin) GetPublicKey(ctx context.Context, req *keymanager.GetPublicKeyRequest) (*keymanager.GetPublicKeyResponse, error) {
+func (p *Plugin) GetPublicKey(ctx context.Context, req *keymanager.GetPublicKeyRequest) (*keymanager.GetPublicKeyResponse, error) {
 	if req.KeyId == "" {
 		return nil, errors.New("KeyId is required")
 	}
 
 	resp := new(keymanager.GetPublicKeyResponse)
 
-	e, ok := k.entry(req.KeyId)
+	e, ok := p.entry(req.KeyId)
 	if !ok {
 		//TODO: isn't it better to return error?
 		return resp, nil
@@ -191,32 +195,45 @@ func (k *Plugin) GetPublicKey(ctx context.Context, req *keymanager.GetPublicKeyR
 	return resp, nil
 }
 
-func (k *Plugin) GetPublicKeys(context.Context, *keymanager.GetPublicKeysRequest) (*keymanager.GetPublicKeysResponse, error) {
-	return nil, nil
+func (p *Plugin) GetPublicKeys(context.Context, *keymanager.GetPublicKeysRequest) (*keymanager.GetPublicKeysResponse, error) {
+	keys := p.publicKeys()
+	return &keymanager.GetPublicKeysResponse{PublicKeys: keys}, nil
 }
 
-func (k *Plugin) GetPluginInfo(context.Context, *spi.GetPluginInfoRequest) (*spi.GetPluginInfoResponse, error) {
+func (p *Plugin) GetPluginInfo(context.Context, *spi.GetPluginInfoRequest) (*spi.GetPluginInfoResponse, error) {
 	return &spi.GetPluginInfoResponse{}, nil
 }
 
-func (k *Plugin) setEntry(spireKeyID string, newEntry *entry) bool {
+func (p *Plugin) setEntry(spireKeyID string, newEntry *entry) bool {
 	//TODO: validate new entry
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	oldEntry, hasKey := k.entries[spireKeyID]
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	oldEntry, hasKey := p.entries[spireKeyID]
 	if hasKey && oldEntry.CreationDate.Unix() > newEntry.CreationDate.Unix() {
 		//TODO: log this. Also when there is a key and it's updated
 		return false
 	}
-	k.entries[spireKeyID] = newEntry
+	p.entries[spireKeyID] = newEntry
 	return true
 }
 
-func (k *Plugin) entry(spireKeyID string) (*entry, bool) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	value, hasKey := k.entries[spireKeyID]
+func (p *Plugin) entry(spireKeyID string) (*entry, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	value, hasKey := p.entries[spireKeyID]
 	return value, hasKey
+}
+
+func (p *Plugin) publicKeys() []*keymanager.PublicKey {
+	var keys []*keymanager.PublicKey
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for _, key := range p.entries {
+		keys = append(keys, key.PublicKey)
+	}
+	return keys
 }
 
 func configure(c string) (*Config, error) {
