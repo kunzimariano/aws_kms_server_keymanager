@@ -10,6 +10,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/kms"
 	"github.com/hashicorp/hcl"
@@ -37,7 +38,7 @@ type entry struct {
 
 type Plugin struct {
 	config    *Config
-	mtx       sync.Mutex
+	mu        sync.Mutex //TODO: review which mutex to use
 	entries   map[string]*entry
 	kmsClient *kms.KMS
 }
@@ -69,7 +70,7 @@ func (k *Plugin) Configure(ctx context.Context, req *plugin.ConfigureRequest) (*
 	k.kmsClient = kmsClient
 
 	// TODO: pagination
-	listKeysResp, err := kmsClient.ListKeys(&kms.ListKeysInput{})
+	listKeysResp, err := kmsClient.ListKeysWithContext(ctx, &kms.ListKeysInput{})
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +78,7 @@ func (k *Plugin) Configure(ctx context.Context, req *plugin.ConfigureRequest) (*
 	for _, key := range listKeysResp.Keys {
 		//TODO: extract into a function
 		awsKeyID := key.KeyId
-		describeResp, err := kmsClient.DescribeKey(&kms.DescribeKeyInput{KeyId: awsKeyID})
+		describeResp, err := kmsClient.DescribeKeyWithContext(ctx, &kms.DescribeKeyInput{KeyId: awsKeyID})
 		if err != nil {
 			return nil, err
 		}
@@ -86,7 +87,7 @@ func (k *Plugin) Configure(ctx context.Context, req *plugin.ConfigureRequest) (*
 		case *describeResp.KeyMetadata.Enabled == true && strings.HasPrefix(*describeResp.KeyMetadata.Description, keyPrefix):
 			descSplit := strings.SplitAfter(*describeResp.KeyMetadata.Description, keyPrefix)
 			spireKeyID := descSplit[1]
-			getPublicKeyResp, err := kmsClient.GetPublicKey(&kms.GetPublicKeyInput{KeyId: awsKeyID})
+			getPublicKeyResp, err := kmsClient.GetPublicKeyWithContext, (&kms.GetPublicKeyInput{KeyId: awsKeyID})
 			if err != nil {
 				return nil, err
 			}
@@ -125,7 +126,7 @@ func (k *Plugin) GenerateKey(ctx context.Context, req *keymanager.GenerateKeyReq
 		return nil, err
 	}
 
-	pub, err := k.kmsClient.GetPublicKey(&kms.GetPublicKeyInput{KeyId: key.KeyMetadata.KeyId})
+	pub, err := k.kmsClient.GetPublicKeyWithContext(ctx, &kms.GetPublicKeyInput{KeyId: key.KeyMetadata.KeyId})
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +146,7 @@ func (k *Plugin) GenerateKey(ctx context.Context, req *keymanager.GenerateKeyReq
 
 	// only delete if an old entry was replaced by a new one
 	if hasOldEntry && ok {
-		_, err := k.kmsClient.ScheduleKeyDeletion(&kms.ScheduleKeyDeletionInput{KeyId: &oldEntry.AwsKeyID})
+		_, err := k.kmsClient.ScheduleKeyDeletionWithContext(ctx, &kms.ScheduleKeyDeletionInput{KeyId: &oldEntry.AwsKeyID})
 		if err != nil {
 			return nil, err
 		}
@@ -200,8 +201,8 @@ func (k *Plugin) GetPluginInfo(context.Context, *spi.GetPluginInfoRequest) (*spi
 
 func (k *Plugin) setEntry(spireKeyID string, newEntry *entry) bool {
 	//TODO: validate new entry
-	k.mtx.Lock()
-	defer k.mtx.Unlock()
+	k.mu.Lock()
+	defer k.mu.Unlock()
 	oldEntry, hasKey := k.entries[spireKeyID]
 	if hasKey && oldEntry.CreationDate.Unix() > newEntry.CreationDate.Unix() {
 		//TODO: log this. Also when there is a key and it's updated
@@ -212,8 +213,8 @@ func (k *Plugin) setEntry(spireKeyID string, newEntry *entry) bool {
 }
 
 func (k *Plugin) entry(spireKeyID string) (*entry, bool) {
-	k.mtx.Lock()
-	defer k.mtx.Unlock()
+	k.mu.Lock()
+	defer k.mu.Unlock()
 	value, hasKey := k.entries[spireKeyID]
 	return value, hasKey
 }
@@ -243,12 +244,11 @@ func newKMSClient(c *Config) (*kms.KMS, error) {
 
 }
 
-// Plugin is the client interface for the service with the plugin related methods used by the catalog to initialize the plugin.
-// type Plugin interface {
-// 	Configure(context.Context, *spi.ConfigureRequest) (*spi.ConfigureResponse, error)
-// 	GenerateKey(context.Context, *keymanager.GenerateKeyRequest) (*keymanager.GenerateKeyResponse, error)
-// 	GetPluginInfo(context.Context, *spi.GetPluginInfoRequest) (*spi.GetPluginInfoResponse, error)
-// 	GetPublicKey(context.Context, *keymanager.GetPublicKeyRequest) (*keymanager.GetPublicKeyResponse, error)
-// 	GetPublicKeys(context.Context, *keymanager.GetPublicKeysRequest) (*keymanager.GetPublicKeysResponse, error)
-// 	SignData(context.Context, *keymanager.SignDataRequest) (*keymanager.SignDataResponse, error)
-// }
+type kmsClient interface {
+	CreateKeyWithContext(aws.Context, *kms.CreateKeyInput, ...request.Option) (*kms.CreateKeyOutput, error)
+	DescribeKeyWithContext(aws.Context, *kms.DescribeKeyInput, ...request.Option) (*kms.DescribeKeyOutput, error)
+	GetPublicKeyWithContext(aws.Context, *kms.GetPublicKeyInput, ...request.Option) (*kms.GetPublicKeyOutput, error)
+	ListKeysWithContext(aws.Context, *kms.ListKeysInput, ...request.Option) (*kms.ListKeysOutput, error)
+	ScheduleKeyDeletionWithContext(aws.Context, *kms.ScheduleKeyDeletionInput, ...request.Option) (*kms.ScheduleKeyDeletionOutput, error)
+	SignWithContext(aws.Context, *kms.SignInput, ...request.Option) (*kms.SignOutput, error)
+}
