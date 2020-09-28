@@ -2,7 +2,6 @@ package kms
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -13,32 +12,40 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/kms"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
 	"github.com/spiffe/spire/proto/spire/common/plugin"
 	"github.com/spiffe/spire/proto/spire/server/keymanager"
+	"github.com/zeebo/errs"
 )
 
 // Major TODOS:
-// - error embellishment and wrapping
-// - logging
 // - maps from spire enums to kms enums
 // - input validations
+// - error embellishment and wrapping
 // - consume kms client through an interface so we can replace it with a fake
 // - kms client fake
 // - testing
 
-const keyPrefix = "SPIRE_SERVER_KEY:"
+var (
+	kmsErr = errs.Class("kms")
+)
 
-type entry struct {
+const (
+	keyPrefix = "SPIRE_SERVER_KEY:"
+)
+
+type keyEntry struct {
 	AwsKeyID     string
 	CreationDate *time.Time //TODO: maybe not a pointer
 	PublicKey    *keymanager.PublicKey
 }
 
 type Plugin struct {
+	log       hclog.Logger
 	config    *Config
 	mu        sync.RWMutex
-	entries   map[string]*entry
+	entries   map[string]*keyEntry
 	kmsClient *kms.KMS
 }
 
@@ -50,7 +57,8 @@ type Config struct {
 
 func New() *Plugin {
 	return &Plugin{
-		entries: make(map[string]*entry),
+		entries: make(map[string]*keyEntry),
+		log:     hclog.Default(),
 	}
 }
 
@@ -77,9 +85,8 @@ func (p *Plugin) Configure(ctx context.Context, req *plugin.ConfigureRequest) (*
 	for _, key := range listKeysResp.Keys {
 		err := p.processKMSKey(ctx, key.KeyId)
 		if err != nil {
-			return nil, err
+			p.log.Error("Failed to process kms key.", "KeyId", *key.KeyId, "error", err)
 		}
-
 	}
 
 	return &plugin.ConfigureResponse{}, nil
@@ -87,6 +94,11 @@ func (p *Plugin) Configure(ctx context.Context, req *plugin.ConfigureRequest) (*
 
 func (p *Plugin) processKMSKey(ctx context.Context, awsKeyID *string) error {
 	describeResp, err := p.kmsClient.DescribeKeyWithContext(ctx, &kms.DescribeKeyInput{KeyId: awsKeyID})
+	if err != nil {
+		return err
+	}
+
+	keyType, err := keyTypeFromKeySpec(*describeResp.KeyMetadata.CustomerMasterKeySpec)
 	if err != nil {
 		return err
 	}
@@ -99,16 +111,16 @@ func (p *Plugin) processKMSKey(ctx context.Context, awsKeyID *string) error {
 			return err
 		}
 
-		e := &entry{
+		e := &keyEntry{
 			AwsKeyID:     *awsKeyID,
 			CreationDate: describeResp.KeyMetadata.CreationDate,
 			PublicKey: &keymanager.PublicKey{
-				Id: spireKeyID,
-				// TODO: KeyType
+				Id:       spireKeyID,
+				Type:     keyType,
 				PkixData: getPublicKeyResp.PublicKey,
 			},
 		}
-		p.setEntry(spireKeyID, e)
+		p.setEntry(spireKeyID, e) //TODO: check return value?
 	}
 	return nil
 }
@@ -116,11 +128,15 @@ func (p *Plugin) processKMSKey(ctx context.Context, awsKeyID *string) error {
 func (p *Plugin) GenerateKey(ctx context.Context, req *keymanager.GenerateKeyRequest) (*keymanager.GenerateKeyResponse, error) {
 	spireKeyID := req.KeyId
 	description := fmt.Sprintf("%v%v", keyPrefix, spireKeyID)
+	keySpec, err := keySpecFromKeyType(req.KeyType)
+	if err != nil {
+		return nil, err
+	}
 
 	createKeyInput := &kms.CreateKeyInput{
 		Description:           aws.String(description), //TODO: check using alias instead
 		KeyUsage:              aws.String(kms.KeyUsageTypeSignVerify),
-		CustomerMasterKeySpec: aws.String(kms.CustomerMasterKeySpecEccNistP256), //TODO: build a map from input to this
+		CustomerMasterKeySpec: aws.String(keySpec),
 		//TODO: look into policies
 	}
 
@@ -134,12 +150,12 @@ func (p *Plugin) GenerateKey(ctx context.Context, req *keymanager.GenerateKeyReq
 		return nil, err
 	}
 
-	newEntry := &entry{
+	newEntry := &keyEntry{
 		AwsKeyID:     *pub.KeyId,
 		CreationDate: key.KeyMetadata.CreationDate,
 		PublicKey: &keymanager.PublicKey{
-			Id: spireKeyID,
-			// TODO: KeyType
+			Id:       spireKeyID,
+			Type:     req.KeyType,
 			PkixData: pub.PublicKey,
 		},
 	}
@@ -159,14 +175,18 @@ func (p *Plugin) GenerateKey(ctx context.Context, req *keymanager.GenerateKeyReq
 }
 
 func (p *Plugin) SignData(ctx context.Context, req *keymanager.SignDataRequest) (*keymanager.SignDataResponse, error) {
+	// SignDataRequest_PssOptions use hash alg, ignore salt
+	// PssOptions may determine whether it is PKCS #1 v1.5 or PSS
+	// opts := req.SignerOpts.(type)
 	keyEntry, hasKey := p.entry(req.KeyId)
 	if !hasKey {
-		return nil, fmt.Errorf("could not find key: %v", req.KeyId)
+		return nil, kmsErr.New("unable to find KeyId: %v", req.KeyId)
 	}
 
 	signResp, err := p.kmsClient.SignWithContext(ctx, &kms.SignInput{
 		KeyId:            &keyEntry.AwsKeyID,
 		Message:          req.Data,
+		MessageType:      aws.String(kms.MessageTypeDigest),
 		SigningAlgorithm: aws.String(kms.SigningAlgorithmSpecEcdsaSha256), //TODO: this should match the they key type we are using plus the input param
 	})
 	if err != nil {
@@ -178,7 +198,7 @@ func (p *Plugin) SignData(ctx context.Context, req *keymanager.SignDataRequest) 
 
 func (p *Plugin) GetPublicKey(ctx context.Context, req *keymanager.GetPublicKeyRequest) (*keymanager.GetPublicKeyResponse, error) {
 	if req.KeyId == "" {
-		return nil, errors.New("KeyId is required")
+		return nil, kmsErr.New("KeyId is required")
 	}
 
 	resp := new(keymanager.GetPublicKeyResponse)
@@ -203,7 +223,7 @@ func (p *Plugin) GetPluginInfo(context.Context, *plugin.GetPluginInfoRequest) (*
 	return &plugin.GetPluginInfoResponse{}, nil
 }
 
-func (p *Plugin) setEntry(spireKeyID string, newEntry *entry) bool {
+func (p *Plugin) setEntry(spireKeyID string, newEntry *keyEntry) bool {
 	//TODO: validate new entry
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -216,7 +236,7 @@ func (p *Plugin) setEntry(spireKeyID string, newEntry *entry) bool {
 	return true
 }
 
-func (p *Plugin) entry(spireKeyID string) (*entry, bool) {
+func (p *Plugin) entry(spireKeyID string) (*keyEntry, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	value, hasKey := p.entries[spireKeyID]
@@ -238,7 +258,7 @@ func (p *Plugin) publicKeys() []*keymanager.PublicKey {
 func configure(c string) (*Config, error) {
 	config := new(Config)
 	if err := hcl.Decode(config, c); err != nil {
-		return nil, fmt.Errorf("unable to decode configuration: %v", err)
+		return nil, kmsErr.New("unable to decode configuration: %v", err)
 	}
 
 	// TODO: validate
@@ -258,6 +278,39 @@ func newKMSClient(c *Config) (*kms.KMS, error) {
 
 	return kms.New(s), nil
 
+}
+
+func keyTypeFromKeySpec(keySpec string) (keymanager.KeyType, error) {
+	switch keySpec {
+	case kms.CustomerMasterKeySpecRsa2048:
+		return keymanager.KeyType_RSA_2048, nil
+	case kms.CustomerMasterKeySpecRsa4096:
+		return keymanager.KeyType_RSA_4096, nil
+	case kms.CustomerMasterKeySpecEccNistP256:
+		return keymanager.KeyType_EC_P256, nil
+	case kms.CustomerMasterKeySpecEccNistP384:
+		return keymanager.KeyType_EC_P384, nil
+	default:
+		return keymanager.KeyType_UNSPECIFIED_KEY_TYPE, kmsErr.New("unsupported")
+	}
+
+}
+
+func keySpecFromKeyType(keyType keymanager.KeyType) (string, error) {
+	switch keyType {
+	case keymanager.KeyType_RSA_1024:
+		return "", kmsErr.New("unsupported")
+	case keymanager.KeyType_RSA_2048:
+		return kms.CustomerMasterKeySpecRsa2048, nil
+	case keymanager.KeyType_RSA_4096:
+		return kms.CustomerMasterKeySpecRsa4096, nil
+	case keymanager.KeyType_EC_P256:
+		return kms.CustomerMasterKeySpecEccNistP256, nil
+	case keymanager.KeyType_EC_P384:
+		return kms.CustomerMasterKeySpecEccNistP384, nil
+	default:
+		return "", kmsErr.New("unknown and unsupported")
+	}
 }
 
 type kmsClient interface {
