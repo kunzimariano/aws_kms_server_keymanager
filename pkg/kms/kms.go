@@ -20,7 +20,6 @@ import (
 )
 
 // Major TODOS:
-// - maps from spire enums to kms enums
 // - input validations
 // - error embellishment and wrapping
 // - consume kms client through an interface so we can replace it with a fake
@@ -92,39 +91,6 @@ func (p *Plugin) Configure(ctx context.Context, req *plugin.ConfigureRequest) (*
 	return &plugin.ConfigureResponse{}, nil
 }
 
-func (p *Plugin) processKMSKey(ctx context.Context, awsKeyID *string) error {
-	describeResp, err := p.kmsClient.DescribeKeyWithContext(ctx, &kms.DescribeKeyInput{KeyId: awsKeyID})
-	if err != nil {
-		return err
-	}
-
-	keyType, err := keyTypeFromKeySpec(*describeResp.KeyMetadata.CustomerMasterKeySpec)
-	if err != nil {
-		return err
-	}
-
-	if *describeResp.KeyMetadata.Enabled == true && strings.HasPrefix(*describeResp.KeyMetadata.Description, keyPrefix) {
-		descSplit := strings.SplitAfter(*describeResp.KeyMetadata.Description, keyPrefix)
-		spireKeyID := descSplit[1]
-		getPublicKeyResp, err := p.kmsClient.GetPublicKeyWithContext(ctx, &kms.GetPublicKeyInput{KeyId: awsKeyID})
-		if err != nil {
-			return err
-		}
-
-		e := &keyEntry{
-			AwsKeyID:     *awsKeyID,
-			CreationDate: describeResp.KeyMetadata.CreationDate,
-			PublicKey: &keymanager.PublicKey{
-				Id:       spireKeyID,
-				Type:     keyType,
-				PkixData: getPublicKeyResp.PublicKey,
-			},
-		}
-		p.setEntry(spireKeyID, e) //TODO: check return value?
-	}
-	return nil
-}
-
 func (p *Plugin) GenerateKey(ctx context.Context, req *keymanager.GenerateKeyRequest) (*keymanager.GenerateKeyResponse, error) {
 	spireKeyID := req.KeyId
 	description := fmt.Sprintf("%v%v", keyPrefix, spireKeyID)
@@ -175,19 +141,21 @@ func (p *Plugin) GenerateKey(ctx context.Context, req *keymanager.GenerateKeyReq
 }
 
 func (p *Plugin) SignData(ctx context.Context, req *keymanager.SignDataRequest) (*keymanager.SignDataResponse, error) {
-	// SignDataRequest_PssOptions use hash alg, ignore salt
-	// PssOptions may determine whether it is PKCS #1 v1.5 or PSS
-	// opts := req.SignerOpts.(type)
 	keyEntry, hasKey := p.entry(req.KeyId)
 	if !hasKey {
 		return nil, kmsErr.New("unable to find KeyId: %v", req.KeyId)
+	}
+
+	signingAlgo, err := signingAlgorithmForKMS(keyEntry.PublicKey.Type, req.SignerOpts)
+	if err != nil {
+		return nil, err
 	}
 
 	signResp, err := p.kmsClient.SignWithContext(ctx, &kms.SignInput{
 		KeyId:            &keyEntry.AwsKeyID,
 		Message:          req.Data,
 		MessageType:      aws.String(kms.MessageTypeDigest),
-		SigningAlgorithm: aws.String(kms.SigningAlgorithmSpecEcdsaSha256), //TODO: this should match the they key type we are using plus the input param
+		SigningAlgorithm: aws.String(signingAlgo),
 	})
 	if err != nil {
 		return nil, err
@@ -255,6 +223,39 @@ func (p *Plugin) publicKeys() []*keymanager.PublicKey {
 	return keys
 }
 
+func (p *Plugin) processKMSKey(ctx context.Context, awsKeyID *string) error {
+	describeResp, err := p.kmsClient.DescribeKeyWithContext(ctx, &kms.DescribeKeyInput{KeyId: awsKeyID})
+	if err != nil {
+		return err
+	}
+
+	keyType, err := keyTypeFromKeySpec(*describeResp.KeyMetadata.CustomerMasterKeySpec)
+	if err != nil {
+		return err
+	}
+
+	if *describeResp.KeyMetadata.Enabled == true && strings.HasPrefix(*describeResp.KeyMetadata.Description, keyPrefix) {
+		descSplit := strings.SplitAfter(*describeResp.KeyMetadata.Description, keyPrefix)
+		spireKeyID := descSplit[1]
+		getPublicKeyResp, err := p.kmsClient.GetPublicKeyWithContext(ctx, &kms.GetPublicKeyInput{KeyId: awsKeyID})
+		if err != nil {
+			return err
+		}
+
+		e := &keyEntry{
+			AwsKeyID:     *awsKeyID,
+			CreationDate: describeResp.KeyMetadata.CreationDate,
+			PublicKey: &keymanager.PublicKey{
+				Id:       spireKeyID,
+				Type:     keyType,
+				PkixData: getPublicKeyResp.PublicKey,
+			},
+		}
+		p.setEntry(spireKeyID, e) //TODO: check return value?
+	}
+	return nil
+}
+
 func configure(c string) (*Config, error) {
 	config := new(Config)
 	if err := hcl.Decode(config, c); err != nil {
@@ -280,6 +281,53 @@ func newKMSClient(c *Config) (*kms.KMS, error) {
 
 }
 
+func signingAlgorithmForKMS(keyType keymanager.KeyType, signerOpts interface{}) (string, error) {
+	var (
+		hashAlgo keymanager.HashAlgorithm
+		isPSS    bool
+	)
+
+	switch opts := signerOpts.(type) {
+	case *keymanager.SignDataRequest_HashAlgorithm:
+		hashAlgo = opts.HashAlgorithm
+		isPSS = false
+	case *keymanager.SignDataRequest_PssOptions:
+		if opts.PssOptions == nil {
+			return "", kmsErr.New("PSS options are nil")
+		}
+		hashAlgo = opts.PssOptions.HashAlgorithm
+		isPSS = true
+		// opts.PssOptions.SaltLength is ignored
+	default:
+		return "", kmsErr.New("unsupported signer opts type %T", opts)
+	}
+
+	isRSA := keyType == keymanager.KeyType_RSA_2048 || keyType == keymanager.KeyType_RSA_4096
+
+	switch {
+	case hashAlgo == keymanager.HashAlgorithm_UNSPECIFIED_HASH_ALGORITHM:
+		return "", kmsErr.New("hash algorithm is required")
+	case keyType == keymanager.KeyType_EC_P256 && hashAlgo == keymanager.HashAlgorithm_SHA256:
+		return kms.SigningAlgorithmSpecEcdsaSha256, nil
+	case keyType == keymanager.KeyType_EC_P384 && hashAlgo == keymanager.HashAlgorithm_SHA384:
+		return kms.SigningAlgorithmSpecEcdsaSha384, nil
+	case isRSA && !isPSS && hashAlgo == keymanager.HashAlgorithm_SHA256:
+		return kms.SigningAlgorithmSpecRsassaPkcs1V15Sha256, nil
+	case isRSA && !isPSS && hashAlgo == keymanager.HashAlgorithm_SHA384:
+		return kms.SigningAlgorithmSpecRsassaPkcs1V15Sha384, nil
+	case isRSA && !isPSS && hashAlgo == keymanager.HashAlgorithm_SHA512:
+		return kms.SigningAlgorithmSpecRsassaPkcs1V15Sha512, nil
+	case isRSA && isPSS && hashAlgo == keymanager.HashAlgorithm_SHA256:
+		return kms.SigningAlgorithmSpecRsassaPssSha256, nil
+	case isRSA && isPSS && hashAlgo == keymanager.HashAlgorithm_SHA384:
+		return kms.SigningAlgorithmSpecRsassaPssSha384, nil
+	case isRSA && isPSS && hashAlgo == keymanager.HashAlgorithm_SHA512:
+		return kms.SigningAlgorithmSpecRsassaPssSha512, nil
+	default:
+		return "", kmsErr.New("unsupported combo of keytype: %v and hashing algo: %v", keyType, hashAlgo)
+	}
+}
+
 func keyTypeFromKeySpec(keySpec string) (keymanager.KeyType, error) {
 	switch keySpec {
 	case kms.CustomerMasterKeySpecRsa2048:
@@ -291,7 +339,7 @@ func keyTypeFromKeySpec(keySpec string) (keymanager.KeyType, error) {
 	case kms.CustomerMasterKeySpecEccNistP384:
 		return keymanager.KeyType_EC_P384, nil
 	default:
-		return keymanager.KeyType_UNSPECIFIED_KEY_TYPE, kmsErr.New("unsupported")
+		return keymanager.KeyType_UNSPECIFIED_KEY_TYPE, kmsErr.New("unsupported keyspec: %v", keySpec)
 	}
 
 }
