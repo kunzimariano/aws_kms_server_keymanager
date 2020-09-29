@@ -8,9 +8,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/kms"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
@@ -21,8 +18,9 @@ import (
 
 // Major TODOS:
 // - input validations
+// - config validation
 // - error embellishment and wrapping
-// - consume kms client through an interface so we can replace it with a fake
+// - move kmsClient into another file plus the init of it. Similar to https://github.com/spiffe/spire/blob/cff72a54c3d3a688d789fb43fd8c5ee830be92e3/pkg/server/plugin/upstreamauthority/awspca/pca_client.go
 // - kms client fake
 // - testing
 
@@ -36,16 +34,15 @@ const (
 
 type keyEntry struct {
 	AwsKeyID     string
-	CreationDate *time.Time //TODO: maybe not a pointer
+	CreationDate time.Time
 	PublicKey    *keymanager.PublicKey
 }
 
 type Plugin struct {
 	log       hclog.Logger
-	config    *Config
 	mu        sync.RWMutex
 	entries   map[string]*keyEntry
-	kmsClient *kms.KMS
+	kmsClient kmsClient
 }
 
 type Config struct {
@@ -57,26 +54,26 @@ type Config struct {
 func New() *Plugin {
 	return &Plugin{
 		entries: make(map[string]*keyEntry),
-		log:     hclog.Default(),
 	}
 }
 
+func (p *Plugin) SetLogger(log hclog.Logger) {
+	p.log = log
+}
+
 func (p *Plugin) Configure(ctx context.Context, req *plugin.ConfigureRequest) (*plugin.ConfigureResponse, error) {
-	config, err := configure(req.Configuration)
+	config, err := validateConfig(req.Configuration)
 	if err != nil {
 		return nil, err
 	}
 
-	p.config = config
-	kmsClient, err := newKMSClient(config)
+	p.kmsClient, err = newKMSClient(config)
 	if err != nil {
 		return nil, err
 	}
-
-	p.kmsClient = kmsClient
 
 	// TODO: pagination
-	listKeysResp, err := kmsClient.ListKeysWithContext(ctx, &kms.ListKeysInput{})
+	listKeysResp, err := p.kmsClient.ListKeysWithContext(ctx, &kms.ListKeysInput{})
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +115,7 @@ func (p *Plugin) GenerateKey(ctx context.Context, req *keymanager.GenerateKeyReq
 
 	newEntry := &keyEntry{
 		AwsKeyID:     *pub.KeyId,
-		CreationDate: key.KeyMetadata.CreationDate,
+		CreationDate: *key.KeyMetadata.CreationDate,
 		PublicKey: &keymanager.PublicKey{
 			Id:       spireKeyID,
 			Type:     req.KeyType,
@@ -244,7 +241,7 @@ func (p *Plugin) processKMSKey(ctx context.Context, awsKeyID *string) error {
 
 		e := &keyEntry{
 			AwsKeyID:     *awsKeyID,
-			CreationDate: describeResp.KeyMetadata.CreationDate,
+			CreationDate: *describeResp.KeyMetadata.CreationDate,
 			PublicKey: &keymanager.PublicKey{
 				Id:       spireKeyID,
 				Type:     keyType,
@@ -256,7 +253,7 @@ func (p *Plugin) processKMSKey(ctx context.Context, awsKeyID *string) error {
 	return nil
 }
 
-func configure(c string) (*Config, error) {
+func validateConfig(c string) (*Config, error) {
 	config := new(Config)
 	if err := hcl.Decode(config, c); err != nil {
 		return nil, kmsErr.New("unable to decode configuration: %v", err)
@@ -267,18 +264,6 @@ func configure(c string) (*Config, error) {
 	// 	return nil, errors.New("some_value is required")
 	// }
 	return config, nil
-}
-
-func newKMSClient(c *Config) (*kms.KMS, error) {
-	creds := credentials.NewStaticCredentials(c.AccessKeyID, c.SecretAccessKey, "")
-	awsConf := &aws.Config{Credentials: creds, Region: aws.String(c.Region)}
-	s, err := session.NewSession(awsConf)
-	if err != nil {
-		return nil, err
-	}
-
-	return kms.New(s), nil
-
 }
 
 func signingAlgorithmForKMS(keyType keymanager.KeyType, signerOpts interface{}) (string, error) {
@@ -297,7 +282,7 @@ func signingAlgorithmForKMS(keyType keymanager.KeyType, signerOpts interface{}) 
 		}
 		hashAlgo = opts.PssOptions.HashAlgorithm
 		isPSS = true
-		// opts.PssOptions.SaltLength is ignored
+		// opts.PssOptions.SaltLength is handled by KMS. The salt length matches the bits of the hashing algorithm.
 	default:
 		return "", kmsErr.New("unsupported signer opts type %T", opts)
 	}
@@ -359,13 +344,4 @@ func keySpecFromKeyType(keyType keymanager.KeyType) (string, error) {
 	default:
 		return "", kmsErr.New("unknown and unsupported")
 	}
-}
-
-type kmsClient interface {
-	CreateKeyWithContext(aws.Context, *kms.CreateKeyInput, ...request.Option) (*kms.CreateKeyOutput, error)
-	DescribeKeyWithContext(aws.Context, *kms.DescribeKeyInput, ...request.Option) (*kms.DescribeKeyOutput, error)
-	GetPublicKeyWithContext(aws.Context, *kms.GetPublicKeyInput, ...request.Option) (*kms.GetPublicKeyOutput, error)
-	ListKeysWithContext(aws.Context, *kms.ListKeysInput, ...request.Option) (*kms.ListKeysOutput, error)
-	ScheduleKeyDeletionWithContext(aws.Context, *kms.ScheduleKeyDeletionInput, ...request.Option) (*kms.ScheduleKeyDeletionOutput, error)
-	SignWithContext(aws.Context, *kms.SignInput, ...request.Option) (*kms.SignOutput, error)
 }
