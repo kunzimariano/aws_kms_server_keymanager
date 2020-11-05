@@ -4,6 +4,7 @@ go 1.15
 
 require (
 	github.com/aws/aws-sdk-go v1.34.31
+	github.com/golang/protobuf v1.3.5
 	github.com/hashicorp/go-hclog v0.13.1-0.20200518165504-8476a63db2c6
 	github.com/hashicorp/go-immutable-radix v1.1.0 // indirect
 	github.com/hashicorp/golang-lru v0.5.3 // indirect
