@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/kms"
@@ -16,18 +17,16 @@ import (
 	"github.com/zeebo/errs"
 )
 
-// TODOS:
-// - timeouts
-
 var (
 	kmsErr = errs.Class("kms")
 )
 
 const (
-	aliasPrefix = "alias/"
-	keyPrefix   = "SPIRE_SERVER_KEY/"
+	aliasPrefix      = "alias/"
+	defaultKeyPrefix = "SPIRE_SERVER_KEY/"
 
-	keyIDTag = "KeyID"
+	keyIDTag = "key_id"
+	aliasTag = "alias"
 )
 
 type keyEntry struct {
@@ -42,6 +41,7 @@ type Plugin struct {
 	mu        sync.RWMutex
 	entries   map[string]keyEntry
 	kmsClient kmsClient
+	keyPrefix string
 
 	hooks struct {
 		newClient func(config *Config) (kmsClient, error)
@@ -53,6 +53,7 @@ type Config struct {
 	AccessKeyID     string `hcl:"access_key_id" json:"access_key_id"`
 	SecretAccessKey string `hcl:"secret_access_key" json:"secret_access_key"`
 	Region          string `hcl:"region" json:"region"`
+	KeyPrefix       string `hcl:"key_prefix" json:"key_prefix"`
 }
 
 // New returns an instantiated plugin
@@ -74,33 +75,27 @@ func (p *Plugin) SetLogger(log hclog.Logger) {
 
 // Configure sets up the plugin
 func (p *Plugin) Configure(ctx context.Context, req *plugin.ConfigureRequest) (*plugin.ConfigureResponse, error) {
-	config, err := validateConfig(req.Configuration)
+	config, err := p.validateConfig(req.Configuration)
 	if err != nil {
 		return nil, err
 	}
+
+	p.keyPrefix = config.KeyPrefix
 
 	p.kmsClient, err = p.hooks.newClient(config)
 	if err != nil {
 		return nil, kmsErr.New("failed to create KMS client: %v", err)
 	}
 
-	// TODO: pagination
-	p.log.Info("Fetching keys from KMS")
-	aliasesResp, err := p.kmsClient.ListAliasesWithContext(ctx, &kms.ListAliasesInput{})
-	if err != nil {
-		return nil, kmsErr.New("failed to fetch keys: %v", err)
-	}
-
-	for _, alias := range aliasesResp.Aliases {
-		entry, err := p.buildKeyEntry(ctx, alias.AliasName, alias.TargetKeyId)
-		switch {
-		case err != nil:
-			return nil, kmsErr.New("failed to process KMS key: %v", err)
-		case entry != nil:
-			err := p.setEntry(entry.PublicKey.Id, *entry)
-			if err != nil {
-				return nil, err
-			}
+	p.log.Debug("Fetching keys from KMS")
+	var nextMarker *string
+	for {
+		nextMarker, err = p.fetchAliasesPage(ctx, nextMarker)
+		if err != nil {
+			return nil, err
+		}
+		if nextMarker == nil {
+			break
 		}
 	}
 
@@ -147,14 +142,15 @@ func (p *Plugin) GenerateKey(ctx context.Context, req *keymanager.GenerateKeyReq
 
 		go func() {
 			//schedule delete
-			_, err = p.kmsClient.ScheduleKeyDeletionWithContext(ctx, &kms.ScheduleKeyDeletionInput{
+			c, cancel := context.WithTimeout(context.Background(), time.Second*30)
+			defer cancel()
+			_, err = p.kmsClient.ScheduleKeyDeletionWithContext(c, &kms.ScheduleKeyDeletionInput{
 				KeyId:               &oldEntry.KMSKeyID,
 				PendingWindowInDays: aws.Int64(7),
 			})
 			if err != nil {
-				p.log.With(keyIDTag, &oldEntry.KMSKeyID).Error("It was not possible to schedule deletion for key: %v", err)
+				p.log.Error("It was not possible to schedule deletion for key", "error", err, keyIDTag, &oldEntry.KMSKeyID)
 			}
-
 		}()
 	}
 
@@ -273,7 +269,7 @@ func (p *Plugin) entry(spireKeyID string) (keyEntry, bool) {
 
 func (p *Plugin) createKey(ctx context.Context, spireKeyID string, keyType keymanager.KeyType) (keyEntry, error) {
 	res := keyEntry{}
-	description := descriptionFromSpireKeyID(spireKeyID)
+	description := p.descriptionFromSpireKeyID(spireKeyID)
 	keySpec, err := keySpecFromKeyType(keyType)
 	if err != nil {
 		return res, err
@@ -297,7 +293,7 @@ func (p *Plugin) createKey(ctx context.Context, spireKeyID string, keyType keyma
 
 	res = keyEntry{
 		KMSKeyID: *pub.KeyId,
-		Alias:    aliasFromSpireKeyID(spireKeyID),
+		Alias:    p.aliasFromSpireKeyID(spireKeyID),
 		PublicKey: &keymanager.PublicKey{
 			Id:       spireKeyID,
 			Type:     keyType,
@@ -309,29 +305,30 @@ func (p *Plugin) createKey(ctx context.Context, spireKeyID string, keyType keyma
 }
 
 func (p *Plugin) buildKeyEntry(ctx context.Context, alias *string, awsKeyID *string) (*keyEntry, error) {
-	describeResp, err := p.kmsClient.DescribeKeyWithContext(ctx, &kms.DescribeKeyInput{KeyId: awsKeyID})
+	l := p.log.With(keyIDTag, *awsKeyID, aliasTag, alias)
+	describeResp, err := p.kmsClient.DescribeKeyWithContext(ctx, &kms.DescribeKeyInput{KeyId: alias})
 	if err != nil {
 		return nil, kmsErr.New("failed to describe key: %v", err)
 	}
 
 	if *describeResp.KeyMetadata.Enabled == false {
-		p.log.With(keyIDTag, awsKeyID).Debug("Skipping disabled key")
+		l.Debug("Skipped disabled key")
 		return nil, nil
 	}
 
-	spireKeyID, err := spireKeyIDFromAlias(*alias)
+	spireKeyID, err := p.spireKeyIDFromAlias(*alias)
 	if err != nil {
-		p.log.With(keyIDTag, awsKeyID).Debug("Skipping key: %v", err)
+		l.Debug("Skipped key", "reason", err)
 		return nil, nil
 	}
 
 	keyType, err := keyTypeFromKeySpec(*describeResp.KeyMetadata.CustomerMasterKeySpec)
 	if err != nil {
-		p.log.With(keyIDTag, awsKeyID).Warn("Skipping key: %v", err)
+		l.Debug("Skipped key", "reason", err)
 		return nil, nil
 	}
 
-	getPublicKeyResp, err := p.kmsClient.GetPublicKeyWithContext(ctx, &kms.GetPublicKeyInput{KeyId: awsKeyID})
+	getPublicKeyResp, err := p.kmsClient.GetPublicKeyWithContext(ctx, &kms.GetPublicKeyInput{KeyId: alias})
 	if err != nil {
 		return nil, kmsErr.New("failed to get public key: %v", err)
 	}
@@ -347,41 +344,73 @@ func (p *Plugin) buildKeyEntry(ctx context.Context, alias *string, awsKeyID *str
 	}, err
 }
 
-func spireKeyIDFromAlias(alias string) (string, error) {
-	tokens := strings.SplitAfter(alias, keyPrefix)
+func (p *Plugin) fetchAliasesPage(ctx context.Context, marker *string) (*string, error) {
+	aliasesResp, err := p.kmsClient.ListAliasesWithContext(ctx, &kms.ListAliasesInput{
+		Marker: marker,
+	})
+	if err != nil {
+		return nil, kmsErr.New("failed to fetch keys: %v", err)
+	}
+
+	p.log.Debug(fmt.Sprintf("%v keys were found", len(aliasesResp.Aliases)))
+
+	for _, alias := range aliasesResp.Aliases {
+		l := p.log.With(keyIDTag, *alias.TargetKeyId, aliasTag, *alias.AliasName)
+		l.Debug("Processing key")
+		entry, err := p.buildKeyEntry(ctx, alias.AliasName, alias.TargetKeyId)
+		switch {
+		case err != nil:
+			return nil, kmsErr.New("failed to process KMS key: %v", err)
+		case entry != nil:
+			err := p.setEntry(entry.PublicKey.Id, *entry)
+			l.Debug("Added key")
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return aliasesResp.NextMarker, nil
+}
+
+func (p *Plugin) spireKeyIDFromAlias(alias string) (string, error) {
+	tokens := strings.SplitAfter(alias, p.keyPrefix)
 	if len(tokens) != 2 {
-		return "", kmsErr.New("alias does not contain SPIRE prefix")
+		return "", fmt.Errorf("alias does not contain SPIRE prefix")
 	}
 
 	return tokens[1], nil
 }
 
-func aliasFromSpireKeyID(spireKeyID string) string {
-	return fmt.Sprintf("%v%v%v", aliasPrefix, keyPrefix, spireKeyID)
+func (p *Plugin) aliasFromSpireKeyID(spireKeyID string) string {
+	return fmt.Sprintf("%v%v%v", aliasPrefix, p.keyPrefix, spireKeyID)
 }
 
-func descriptionFromSpireKeyID(spireKeyID string) string {
-	return fmt.Sprintf("%v%v", keyPrefix, spireKeyID)
+func (p *Plugin) descriptionFromSpireKeyID(spireKeyID string) string {
+	return fmt.Sprintf("%v%v", p.keyPrefix, spireKeyID)
 }
 
 // validateConfig returns an error if any configuration provided does not meet acceptable criteria
-func validateConfig(c string) (*Config, error) {
+func (p *Plugin) validateConfig(c string) (*Config, error) {
 	config := new(Config)
 
 	if err := hcl.Decode(config, c); err != nil {
 		return nil, kmsErr.New("unable to decode configuration: %v", err)
 	}
 
+	if config.Region == "" {
+		return nil, kmsErr.New("configuration is missing a region")
+	}
+
 	if config.AccessKeyID == "" {
-		return nil, kmsErr.New("configuration is missing an access key id")
+		p.log.Warn("configuration is missing an access key id, make sure your EC2 instance can access KMS")
 	}
 
 	if config.SecretAccessKey == "" {
-		return nil, kmsErr.New("configuration is missing a secret access key")
+		p.log.Warn("configuration is missing a secret access key, make sure your EC2 instance can access KMS")
 	}
 
-	if config.Region == "" {
-		return nil, kmsErr.New("configuration is missing a region")
+	if config.KeyPrefix == "" {
+		config.KeyPrefix = defaultKeyPrefix
 	}
 
 	return config, nil
@@ -445,7 +474,7 @@ func keyTypeFromKeySpec(keySpec string) (keymanager.KeyType, error) {
 	case kms.CustomerMasterKeySpecEccNistP384:
 		return keymanager.KeyType_EC_P384, nil
 	default:
-		return keymanager.KeyType_UNSPECIFIED_KEY_TYPE, kmsErr.New("unsupported key spec: %v", keySpec)
+		return keymanager.KeyType_UNSPECIFIED_KEY_TYPE, fmt.Errorf("unsupported key spec: %v", keySpec)
 	}
 
 }
