@@ -2,7 +2,7 @@
 
 The `kms` key manager plugin leverages the AWS Key Management Service (KMS) to create, maintain and rotate key pairs (as [Customer master keys](https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#master_keys), or CMKs), and sign SVIDs as needed, with the private key never leaving KMS.
 
-## Build binary
+## Build binary for linux
 
 Building the binary requires go 1.15.0.
 
