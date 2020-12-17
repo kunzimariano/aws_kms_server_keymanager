@@ -16,12 +16,28 @@ The plugin accepts the following configuration options:
 
 | Key | Type | Required | Description |
 | - | - | - | - |
-| access_key_id | string | yes | The Access Key Id used to authenticate to KMS
-| secret_access_key | string | yes | The Secret Access Key used to authenticate to KMS
+| access_key_id | string | see [AWS KMS Access](#aws-kms-access) | The Access Key Id used to authenticate to KMS
+| secret_access_key | string | see [AWS KMS Access](#aws-kms-access) | The Secret Access Key used to authenticate to KMS
 | region | string | yes | The region where the keys will be stored
 | key_prefix | string | [1] see below| A unique prefix per server in the same trust domain.
 
-[1] key_prefix is **optional** when running one server in the same account and region. When running more than one server, the prefix **must be set and must be different** on each one. This is a common scenario when running in HA mode.
+[1] `key_prefix` is **optional** when running a single server. When running more than one server, the prefix **must be set and must be different** on each one. This is a common scenario when running in HA mode. A valid key prefix can be any arbitrary string that uniquely identifies a server instance, like `SERVER_A/` or `prod-server-1/`. It defaults to `SPIRE_SERVER_KEY/` if not specified.
+
+
+### AWS KMS Access
+
+Access to AWS KMS can be given by either setting the `access_key_id` and `secret_access_key`, or by ensuring that the plugin runs on an EC2 instance with a given IAM role that has a specific set of permissions.
+
+The IAM role must have an attached policy with the following permissions:
+
+- `kms:CreateAlias`
+- `kms:CreateKey`
+- `kms:DescribeKey`
+- `kms:GetPublicKey`
+- `kms:ListAliases`
+- `kms:ScheduleKeyDeletion`
+- `kms:Sign`
+- `kms:UpdateAlias`
 
 ## Sample plugin configuration
 
