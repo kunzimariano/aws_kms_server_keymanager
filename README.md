@@ -1,3 +1,7 @@
+> [!IMPORTANT] 
+> Use the official implementation instead: https://github.com/spiffe/spire/blob/main/doc/plugin_server_keymanager_aws_kms.md
+
+
 # Server plugin: KeyManager "kms"
 
 The `kms` key manager plugin leverages the AWS Key Management Service (KMS) to create, maintain and rotate key pairs (as [Customer master keys](https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#master_keys), or CMKs), and sign SVIDs as needed, with the private key never leaving KMS.
